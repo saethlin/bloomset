@@ -1,0 +1,17 @@
+[package]
+name = "bloomset"
+version = "0.1.0"
+authors = ["Ben Kimock <kimockb@gmail.com>"]
+edition = "2018"
+
+[dev-dependencies]
+fnv = "1.0"
+criterion = "0.3"
+
+[[bench]]
+name = "insert"
+harness = false
+
+[profile.bench]
+codegen-units = 1
+debug = 2
