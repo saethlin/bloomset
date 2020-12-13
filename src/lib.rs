@@ -16,7 +16,8 @@ pub struct BloomSet<T> {
     capacity: usize,
 }
 
-struct BloomHasher {
+#[derive(Default)]
+pub struct BloomHasher {
     state: u8,
 }
 
@@ -30,7 +31,7 @@ impl Hasher for BloomHasher {
 
     #[inline]
     fn finish(&self) -> u64 {
-        u64::from(self.state ^ (self.state >> 4))
+        u64::from(self.state)
     }
 }
 
@@ -73,27 +74,13 @@ impl<T> BloomSet<T> {
     #[inline]
     #[must_use]
     pub const fn len(&self) -> usize {
-        self.length & 0x0000_FFFF_FFFF_FFFF
+        self.length & 0x0000_0000_0000_00FF
     }
 
     #[inline]
     #[must_use]
     pub const fn capacity(&self) -> usize {
-        self.capacity & 0x0000_FFFF_FFFF_FFFF
-    }
-
-    #[inline]
-    #[must_use]
-    const fn bloom_contains(&self, bloom: u32) -> bool {
-        if bloom > u16::MAX as u32 {
-            let bits = self.length.to_le_bytes();
-            let bloom_chunk = u16::from_le_bytes([bits[6], bits[7]]);
-            (bloom_chunk & (bloom >> 16) as u16) > 0
-        } else {
-            let bits = self.capacity.to_le_bytes();
-            let bloom_chunk = u16::from_le_bytes([bits[6], bits[7]]);
-            (bloom_chunk & bloom as u16) > 0
-        }
+        self.capacity & 0x0000_0000_0000_00FF
     }
 
     #[inline]
@@ -118,10 +105,13 @@ impl<T> BloomSet<T> {
                 self.capacity(),
             ))
         };
+        if vec.capacity() > u8::MAX as usize {
+            panic!("A BloomSet's capacity cannot exceed 255");
+        }
         vec.push(item);
         unsafe { self.ptr = NonNull::new_unchecked(vec.as_mut_ptr()) };
         self.capacity =
-            (vec.capacity() & 0x0000_FFFF_FFFF_FFFF) | (self.capacity & 0xFFFF_0000_0000_0000);
+            (vec.capacity() & 0x0000_0000_0000_00FF) | (self.capacity & 0xFFFF_FFFF_FFFF_FF00);
     }
 
     pub fn clear(&mut self) {
@@ -133,9 +123,23 @@ impl<T> BloomSet<T> {
                 self.capacity(),
             ))
         };
+        // Drop all the elements
         vec.clear();
-        self.capacity &= 0x0000_FFFF_FFFF_FFFF;
+        // Zero the bloom filter
+        self.capacity &= 0x0000_0000_0000_00FF;
         self.length = 0;
+    }
+
+    #[inline]
+    #[must_use]
+    const fn bloom_contains(&self, bloom_bit: u64) -> bool {
+        if bloom_bit >= 56 {
+            let bloom = 1 << (8 + bloom_bit - 56);
+            (self.length & 0xFFFF_FFFF_FFFF_FF00 & bloom) != 0
+        } else {
+            let bloom = 1 << (8 + bloom_bit);
+            (self.capacity & 0xFFFF_FFFF_FFFF_FF00 & bloom) != 0
+        }
     }
 }
 
@@ -145,30 +149,27 @@ impl<T: Hash + PartialEq> BloomSet<T> {
         let mut hasher = BloomHasher { state: 0 };
         item.hash(&mut hasher);
         let hash = hasher.finish();
-        let bloom_bit = 1 << (hash % 32);
+        let mut bloom_bit = hash;
+        if bloom_bit >= 224 {
+            bloom_bit -= 224;
+        } else if bloom_bit >= 112 {
+            bloom_bit -= 112;
+        }
 
-        let maybe_in_set = if bloom_bit > u16::MAX as u32 {
-            let mut bits = self.length.to_le_bytes();
-            let bloom_chunk = u16::from_le_bytes([bits[6], bits[7]]);
-            if (bloom_chunk & (bloom_bit >> 16) as u16) > 0 {
+        let maybe_in_set = if bloom_bit >= 56 {
+            let bloom = 1 << (8 + bloom_bit - 56);
+            if (self.length & 0xFFFF_FFFF_FFFF_FF00 & bloom) != 0 {
                 true
             } else {
-                let new_bloom_chunk = bloom_chunk | (bloom_bit >> 16) as u16;
-                bits[6] = new_bloom_chunk.to_le_bytes()[0];
-                bits[7] = new_bloom_chunk.to_le_bytes()[1];
-                self.length = usize::from_le_bytes(bits);
+                self.length |= bloom;
                 false
             }
         } else {
-            let mut bits = self.capacity.to_le_bytes();
-            let bloom_chunk = u16::from_le_bytes([bits[6], bits[7]]);
-            if (bloom_chunk & bloom_bit as u16) > 0 {
+            let bloom = 1 << (8 + bloom_bit);
+            if (self.capacity & 0xFFFF_FFFF_FFFF_FF00 & bloom) != 0 {
                 true
             } else {
-                let new_bloom_chunk = bloom_chunk | bloom_bit as u16;
-                bits[6] = new_bloom_chunk.to_le_bytes()[0];
-                bits[7] = new_bloom_chunk.to_le_bytes()[1];
-                self.capacity = usize::from_le_bytes(bits);
+                self.capacity |= bloom;
                 false
             }
         };
@@ -189,18 +190,6 @@ impl<T: Hash + PartialEq> BloomSet<T> {
             }
             self.length += 1;
         }
-
-        /*
-        let maybe_in_set = self.bloom_contains(bloom_bit);
-        let in_set = if maybe_in_set {
-            self.as_slice().iter().any(|it| *it == item)
-        } else {
-            false
-        };
-        if !in_set {
-            self.insert_unique(item, bloom_bit);
-        }
-        */
     }
 
     #[inline]
@@ -209,7 +198,7 @@ impl<T: Hash + PartialEq> BloomSet<T> {
         let mut hasher = BloomHasher { state: 0 };
         item.hash(&mut hasher);
         let hash = hasher.finish();
-        let bloom_bit = 1 << (hash % 32);
+        let bloom_bit = hash % 112;
 
         let maybe_in_set = self.bloom_contains(bloom_bit);
         if maybe_in_set {
